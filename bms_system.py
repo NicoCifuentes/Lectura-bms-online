@@ -1,48 +1,96 @@
 import asyncio
-import time
-import sqlite3
-import requests
 import json
+import sqlite3
+import time
+from urllib.parse import urlsplit
+
+import requests
 from bleak import BleakClient
 
 # ================= CONFIG =================
 
-ADDRESS = "A5:C2:37:27:3B:5F" #Cambiar segun baterias
+ADDRESS = "A5:C2:37:58:BF:EA"  # Cambiar segun bateria
 
 NOTIFY_CHAR = "0000ff01-0000-1000-8000-00805f9b34fb"
-WRITE_CHAR  = "0000ff02-0000-1000-8000-00805f9b34fb"
+WRITE_CHAR = "0000ff02-0000-1000-8000-00805f9b34fb"
 
 READ_INTERVAL = 60
+REQUEST_TIMEOUT = 8
+PENDING_BATCH_SIZE = 50
 
 API_URL = "http://api.oceandev.cl/api/data"
-TOKEN = "bms-dxn8pgultc0ig4rhai5uqgpc" #Cambiar con el token que te entrega la plataforma
+TOKEN = "bms-rulltnrmv3uinuzkwmrnjnhk"  # Cambiar por el token entregado por la plataforma
 
 DB_PATH = "bms.db"
 
+
+# ================= HTTP =================
+
+session = requests.Session()
+session.headers.update(
+    {
+        "Content-Type": "application/json",
+        "User-Agent": "rpi-bms-uploader/2.0",
+    }
+)
+
+
 # ================= DB =================
 
-conn = sqlite3.connect(DB_PATH)
+conn = sqlite3.connect(DB_PATH, timeout=30)
+conn.row_factory = sqlite3.Row
 cursor = conn.cursor()
 
 conn.execute("PRAGMA journal_mode=WAL;")
+conn.execute("PRAGMA synchronous=NORMAL;")
 
-cursor.execute("""
-CREATE TABLE IF NOT EXISTS bms_data (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    ts INTEGER,
-    voltage REAL,
-    current REAL,
-    power REAL,
-    soc INTEGER,
-    cap_rem REAL,
-    cap_nom REAL,
-    cycles INTEGER,
-    delta_v REAL,
-    status TEXT,
-    uploaded INTEGER DEFAULT 0
-)
-""")
-conn.commit()
+def ensure_schema():
+    cursor.execute(
+        """
+        CREATE TABLE IF NOT EXISTS bms_data (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            ts INTEGER NOT NULL,
+            voltage REAL,
+            current REAL,
+            power REAL,
+            soc INTEGER,
+            cap_rem REAL,
+            cap_nom REAL,
+            cycles INTEGER,
+            delta_v REAL,
+            status TEXT,
+            uploaded INTEGER DEFAULT 0,
+            uploaded_at INTEGER DEFAULT NULL
+        )
+        """
+    )
+
+    existing_columns = {
+        row["name"]
+        for row in cursor.execute("PRAGMA table_info(bms_data)").fetchall()
+    }
+
+    if "uploaded_at" not in existing_columns:
+        cursor.execute(
+            """
+            ALTER TABLE bms_data
+            ADD COLUMN uploaded_at INTEGER DEFAULT NULL
+            """
+        )
+        print("[DB] Added missing column: uploaded_at")
+
+    cursor.execute(
+        """
+        CREATE INDEX IF NOT EXISTS idx_bms_uploaded_id
+        ON bms_data (uploaded, id)
+        """
+    )
+
+    conn.commit()
+
+
+ensure_schema()
+
 
 # ================= STATUS =================
 
@@ -60,26 +108,33 @@ def get_status(data):
     if current > 0.2:
         return "cargando"
 
-    elif current < -0.2:
+    if current < -0.2:
         return "descargando"
 
-    else:
-        return "reposo"
+    return "reposo"
 
-# ================= INTERNET =================
 
-def has_internet():
+# ================= CONNECTIVITY =================
+
+def api_reachable():
+    target = urlsplit(API_URL)
+    probe_url = f"{target.scheme}://{target.netloc}/"
+
     try:
-        requests.get("https://www.google.com", timeout=3)
+        response = session.get(probe_url, timeout=3)
+        print(f"[NET] API reachable: {probe_url} -> {response.status_code}")
         return True
-    except:
+    except Exception as exc:
+        print(f"[NET] API unreachable: {exc}")
         return False
+
 
 # ================= API =================
 
 def upload_to_server(data):
     payload = {
         "token": TOKEN,
+        "ts": data["ts"],
         "data": {
             "v": data["voltage"],
             "c": data["current"],
@@ -89,70 +144,108 @@ def upload_to_server(data):
             "cn": data["capacity_nom_ah"],
             "cy": data["cycles"],
             "dv": data["delta_v"],
-            "st": data["status"]
-        }
+            "st": data["status"],
+        },
     }
 
     try:
-        r = requests.post(API_URL, json=payload, timeout=5)
-        print("STATUS:", r.status_code, r.text)
-        return r.status_code in (200, 201)
-    except Exception as e:
-        print("Error conexion:", e)
+        response = session.post(API_URL, data=json.dumps(payload), timeout=REQUEST_TIMEOUT)
+        print(f"[API] POST {response.status_code} -> {response.text[:200]}")
+        return response.status_code in (200, 201)
+    except Exception as exc:
+        print(f"[API] Upload error: {exc}")
         return False
+
+
 # ================= BUFFER =================
 
 def save_local(data):
-
-    cursor.execute("""
-        INSERT INTO bms_data 
+    cursor.execute(
+        """
+        INSERT INTO bms_data
         (ts, voltage, current, power, soc, cap_rem, cap_nom, cycles, delta_v, status, uploaded)
         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0)
-    """, (
-        data["ts"],
-        data["voltage"],
-        data["current"],
-        data["power"],
-        data["soc"],
-        data["capacity_rem_ah"],
-        data["capacity_nom_ah"],
-        data["cycles"],
-        data["delta_v"],
-        data["status"]
-    ))
+        """,
+        (
+            data["ts"],
+            data["voltage"],
+            data["current"],
+            data["power"],
+            data["soc"],
+            data["capacity_rem_ah"],
+            data["capacity_nom_ah"],
+            data["cycles"],
+            data["delta_v"],
+            data["status"],
+        ),
+    )
 
     conn.commit()
 
+
+def pending_count():
+    row = cursor.execute(
+        "SELECT COUNT(*) AS total FROM bms_data WHERE uploaded = 0"
+    ).fetchone()
+    return row["total"] if row else 0
+
+
 def upload_pending():
+    total_uploaded = 0
 
-    rows = cursor.execute("""
-        SELECT * FROM bms_data 
-        WHERE uploaded = 0 
-        ORDER BY id ASC 
-        LIMIT 20
-    """).fetchall()
+    while True:
+        rows = cursor.execute(
+            """
+            SELECT *
+            FROM bms_data
+            WHERE uploaded = 0
+            ORDER BY id ASC
+            LIMIT ?
+            """,
+            (PENDING_BATCH_SIZE,),
+        ).fetchall()
 
-    for row in rows:
+        if not rows:
+            if total_uploaded:
+                print(f"[SYNC] Backlog drained: {total_uploaded} rows uploaded.")
+            return total_uploaded
 
-        data = {
-            "ts": row[1],
-            "voltage": row[2],
-            "current": row[3],
-            "power": row[4],
-            "soc": row[5],
-            "capacity_rem_ah": row[6],
-            "capacity_nom_ah": row[7],
-            "cycles": row[8],
-            "delta_v": row[9],
-            "status": row[10]
-        }
+        uploaded_this_batch = 0
 
-        if upload_to_server(data):
-            cursor.execute("UPDATE bms_data SET uploaded = 1 WHERE id = ?", (row[0],))
-            conn.commit()
-            print("? Enviado ID:", row[0])
-        else:
-            break
+        for row in rows:
+            data = {
+                "ts": row["ts"],
+                "voltage": row["voltage"],
+                "current": row["current"],
+                "power": row["power"],
+                "soc": row["soc"],
+                "capacity_rem_ah": row["cap_rem"],
+                "capacity_nom_ah": row["cap_nom"],
+                "cycles": row["cycles"],
+                "delta_v": row["delta_v"],
+                "status": row["status"],
+            }
+
+            if upload_to_server(data):
+                cursor.execute(
+                    """
+                    UPDATE bms_data
+                    SET uploaded = 1, uploaded_at = ?
+                    WHERE id = ?
+                    """,
+                    (int(time.time()), row["id"]),
+                )
+                conn.commit()
+                uploaded_this_batch += 1
+                total_uploaded += 1
+                print(f"[SYNC] Uploaded local row id={row['id']} ts={row['ts']}")
+            else:
+                print("[SYNC] Upload stopped due to API failure.")
+                return total_uploaded
+
+        if uploaded_this_batch < len(rows):
+            return total_uploaded
+
 
 # ================= BLE =================
 
@@ -160,35 +253,38 @@ def cmd(frame):
     tail = {0x03: (0xFF, 0xFD), 0x04: (0xFF, 0xFC)}
     return bytearray([0xDD, 0xA5, frame, 0x00, tail[frame][0], tail[frame][1], 0x77])
 
-def extract_payload(pkt):
-    if len(pkt) < 6:
-        return None
-    return pkt[4:-1]
 
-def parse_basic(p):
+def extract_payload(packet):
+    if len(packet) < 6:
+        return None
+    return packet[4:-1]
+
+
+def parse_basic(payload):
     return {
-        "voltage": int.from_bytes(p[0:2], "big") / 100,
-        "current": int.from_bytes(p[2:4], "big", signed=True) / 100,
-        "cap_rem": int.from_bytes(p[4:6], "big") / 100,
-        "cap_nom": int.from_bytes(p[6:8], "big") / 100,
-        "cycles": int.from_bytes(p[8:10], "big"),
-        "soc": p[19] if len(p) > 19 else None
+        "voltage": int.from_bytes(payload[0:2], "big") / 100,
+        "current": int.from_bytes(payload[2:4], "big", signed=True) / 100,
+        "cap_rem": int.from_bytes(payload[4:6], "big") / 100,
+        "cap_nom": int.from_bytes(payload[6:8], "big") / 100,
+        "cycles": int.from_bytes(payload[8:10], "big"),
+        "soc": payload[19] if len(payload) > 19 else None,
     }
 
-def parse_cells(p):
+
+def parse_cells(payload):
     cells = []
-    for i in range(0, len(p), 2):
-        mv = int.from_bytes(p[i:i+2], "big")
-        if 1000 <= mv <= 5000:
-            cells.append(mv / 1000.0)
+    for index in range(0, len(payload), 2):
+        millivolts = int.from_bytes(payload[index:index + 2], "big")
+        if 1000 <= millivolts <= 5000:
+            cells.append(millivolts / 1000.0)
     return cells
 
-async def request_packet(client, frame):
 
+async def request_packet(client, frame):
     buffer = bytearray()
     event = asyncio.Event()
 
-    def notify(sender, data):
+    def notify(_sender, data):
         nonlocal buffer
         buffer.extend(data)
         if 0x77 in data:
@@ -199,84 +295,84 @@ async def request_packet(client, frame):
 
     try:
         await asyncio.wait_for(event.wait(), timeout=5)
-    except:
+    except Exception:
         await client.stop_notify(NOTIFY_CHAR)
         return None
 
     await client.stop_notify(NOTIFY_CHAR)
 
     try:
-        s = buffer.index(0xDD)
-        e = buffer.index(0x77, s)
-        return buffer[s:e+1]
-    except:
+        start = buffer.index(0xDD)
+        end = buffer.index(0x77, start)
+        return buffer[start:end + 1]
+    except Exception:
         return None
+
 
 async def get_sample(client):
+    packet_03 = await request_packet(client, 0x03)
+    packet_04 = await request_packet(client, 0x04)
 
-    pkt03 = await request_packet(client, 0x03)
-    pkt04 = await request_packet(client, 0x04)
-
-    if not pkt03 or not pkt04:
+    if not packet_03 or not packet_04:
         return None
 
-    p03 = extract_payload(pkt03)
-    p04 = extract_payload(pkt04)
+    payload_03 = extract_payload(packet_03)
+    payload_04 = extract_payload(packet_04)
 
-    if not p03 or not p04:
+    if not payload_03 or not payload_04:
         return None
 
-    info = parse_basic(p03)
-    cells = parse_cells(p04)
+    info = parse_basic(payload_03)
+    cells = parse_cells(payload_04)
 
     if not cells:
         return None
 
     vmin = min(cells)
     vmax = max(cells)
+    timestamp = int(time.time())
 
     data = {
-        "ts": int(time.time()),
+        "ts": timestamp,
         "voltage": info["voltage"],
         "current": info["current"],
-        "power": info["voltage"] * info["current"],
+        "power": round(info["voltage"] * info["current"], 3),
         "soc": info["soc"],
         "capacity_rem_ah": info["cap_rem"],
         "capacity_nom_ah": info["cap_nom"],
         "cycles": info["cycles"],
-        "delta_v": vmax - vmin
+        "delta_v": round(vmax - vmin, 4),
     }
 
     data["status"] = get_status(data)
-
     return data
+
 
 # ================= MAIN =================
 
 async def main_loop():
-
     while True:
         try:
             async with BleakClient(ADDRESS) as client:
-                print("?? Conectado al BMS")
+                print(f"[BLE] Connected to BMS {ADDRESS}")
 
                 while True:
-
                     data = await get_sample(client)
 
                     if data:
-                        print("??", data)
-
+                        print(f"[BMS] Sample: {data}")
                         save_local(data)
+                        print(f"[DB] Local sample stored. Pending rows: {pending_count()}")
 
-                        if has_internet():
+                        if api_reachable():
                             upload_pending()
 
                     await asyncio.sleep(READ_INTERVAL)
 
-        except Exception as e:
-            print("Error BLE:", e)
+        except Exception as exc:
+            print(f"[BLE] Connection error: {exc}")
             await asyncio.sleep(10)
+
 
 # ================= RUN =================
 
