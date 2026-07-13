@@ -1,5 +1,6 @@
 import asyncio
 import json
+import os
 import sqlite3
 import time
 from urllib.parse import urlsplit
@@ -9,7 +10,7 @@ from bleak import BleakClient
 
 # ================= CONFIG =================
 
-ADDRESS = "A5:C2:37:58:BF:C4"  # Cambiar segun bateria
+ADDRESS = "A5:C2:37:58:BF:C4"
 
 NOTIFY_CHAR = "0000ff01-0000-1000-8000-00805f9b34fb"
 WRITE_CHAR = "0000ff02-0000-1000-8000-00805f9b34fb"
@@ -19,10 +20,13 @@ REQUEST_TIMEOUT = 8
 PENDING_BATCH_SIZE = 50
 
 API_URL = "http://api.oceandev.cl/api/data"
-TOKEN = "bms-nykm09shedunhzw3yiywbrjw"  # Cambiar por el token entregado por la plataforma
+TOKEN = "bms-nykm09shedunhzw3yiywbrjw"
 
-DB_PATH = "bms.db"
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+DB_PATH = os.path.join(BASE_DIR, "bms.db")
+TABLE_NAME = "bms_data"
 
+print(f"[DB] Usando SQLite en: {DB_PATH}")
 
 # ================= HTTP =================
 
@@ -30,10 +34,9 @@ session = requests.Session()
 session.headers.update(
     {
         "Content-Type": "application/json",
-        "User-Agent": "rpi-bms-uploader/2.0",
+        "User-Agent": "rpi-bms-uploader/3.0",
     }
 )
-
 
 # ================= DB =================
 
@@ -44,10 +47,34 @@ cursor = conn.cursor()
 conn.execute("PRAGMA journal_mode=WAL;")
 conn.execute("PRAGMA synchronous=NORMAL;")
 
+
+def print_schema_debug():
+    try:
+        tables = cursor.execute(
+            "SELECT name FROM sqlite_master WHERE type='table' ORDER BY name"
+        ).fetchall()
+        print("[DB] Tablas disponibles:")
+        if not tables:
+            print(" - (ninguna)")
+        else:
+            for row in tables:
+                print(f" - {row['name']}")
+
+        columns = cursor.execute(f"PRAGMA table_info({TABLE_NAME})").fetchall()
+        if columns:
+            print(f"[DB] Columnas de {TABLE_NAME}:")
+            for col in columns:
+                print(f" - {col['name']} ({col['type']})")
+        else:
+            print(f"[DB] La tabla {TABLE_NAME} aun no existe.")
+    except Exception as exc:
+        print(f"[DB] Error leyendo esquema: {exc}")
+
+
 def ensure_schema():
     cursor.execute(
-        """
-        CREATE TABLE IF NOT EXISTS bms_data (
+        f"""
+        CREATE TABLE IF NOT EXISTS {TABLE_NAME} (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             ts INTEGER NOT NULL,
             voltage REAL,
@@ -68,13 +95,13 @@ def ensure_schema():
 
     existing_columns = {
         row["name"]
-        for row in cursor.execute("PRAGMA table_info(bms_data)").fetchall()
+        for row in cursor.execute(f"PRAGMA table_info({TABLE_NAME})").fetchall()
     }
 
     if "uploaded_at" not in existing_columns:
         cursor.execute(
-            """
-            ALTER TABLE bms_data
+            f"""
+            ALTER TABLE {TABLE_NAME}
             ADD COLUMN uploaded_at INTEGER DEFAULT NULL
             """
         )
@@ -82,27 +109,29 @@ def ensure_schema():
 
     if "temperature" not in existing_columns:
         cursor.execute(
-            """
-            ALTER TABLE bms_data
+            f"""
+            ALTER TABLE {TABLE_NAME}
             ADD COLUMN temperature REAL DEFAULT NULL
             """
         )
         print("[DB] Added missing column: temperature")
 
     cursor.execute(
-        """
-        CREATE INDEX IF NOT EXISTS idx_bms_uploaded_id
-        ON bms_data (uploaded, id)
+        f"""
+        CREATE INDEX IF NOT EXISTS idx_{TABLE_NAME}_uploaded_id
+        ON {TABLE_NAME} (uploaded, id)
         """
     )
 
     conn.commit()
+    print("[DB] Esquema SQLite verificado.")
 
 
 ensure_schema()
-
+print_schema_debug()
 
 # ================= STATUS =================
+
 
 def get_status(data):
     current = data["current"]
@@ -126,6 +155,7 @@ def get_status(data):
 
 # ================= CONNECTIVITY =================
 
+
 def api_reachable():
     target = urlsplit(API_URL)
     probe_url = f"{target.scheme}://{target.netloc}/"
@@ -140,6 +170,7 @@ def api_reachable():
 
 
 # ================= API =================
+
 
 def upload_to_server(data):
     payload = {
@@ -161,7 +192,7 @@ def upload_to_server(data):
 
     try:
         response = session.post(API_URL, data=json.dumps(payload), timeout=REQUEST_TIMEOUT)
-        print(f"[API] POST {response.status_code} -> {response.text[:200]}")
+        print(f"[API] POST {response.status_code} -> {response.text[:500]}")
         return response.status_code in (200, 201)
     except Exception as exc:
         print(f"[API] Upload error: {exc}")
@@ -170,10 +201,11 @@ def upload_to_server(data):
 
 # ================= BUFFER =================
 
+
 def save_local(data):
     cursor.execute(
-        """
-        INSERT INTO bms_data
+        f"""
+        INSERT INTO {TABLE_NAME}
         (ts, voltage, current, power, soc, cap_rem, cap_nom, cycles, delta_v, temperature, status, uploaded)
         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0)
         """,
@@ -197,7 +229,7 @@ def save_local(data):
 
 def pending_count():
     row = cursor.execute(
-        "SELECT COUNT(*) AS total FROM bms_data WHERE uploaded = 0"
+        f"SELECT COUNT(*) AS total FROM {TABLE_NAME} WHERE uploaded = 0"
     ).fetchone()
     return row["total"] if row else 0
 
@@ -207,9 +239,9 @@ def upload_pending():
 
     while True:
         rows = cursor.execute(
-            """
+            f"""
             SELECT *
-            FROM bms_data
+            FROM {TABLE_NAME}
             WHERE uploaded = 0
             ORDER BY id ASC
             LIMIT ?
@@ -241,8 +273,8 @@ def upload_pending():
 
             if upload_to_server(data):
                 cursor.execute(
-                    """
-                    UPDATE bms_data
+                    f"""
+                    UPDATE {TABLE_NAME}
                     SET uploaded = 1, uploaded_at = ?
                     WHERE id = ?
                     """,
@@ -262,6 +294,7 @@ def upload_pending():
 
 # ================= BLE =================
 
+
 def cmd(frame):
     tail = {0x03: (0xFF, 0xFD), 0x04: (0xFF, 0xFC)}
     return bytearray([0xDD, 0xA5, frame, 0x00, tail[frame][0], tail[frame][1], 0x77])
@@ -271,18 +304,6 @@ def extract_payload(packet):
     if len(packet) < 6:
         return None
     return packet[4:-1]
-
-
-def parse_basic(payload):
-    return {
-        "voltage": int.from_bytes(payload[0:2], "big") / 100,
-        "current": int.from_bytes(payload[2:4], "big", signed=True) / 100,
-        "cap_rem": int.from_bytes(payload[4:6], "big") / 100,
-        "cap_nom": int.from_bytes(payload[6:8], "big") / 100,
-        "cycles": int.from_bytes(payload[8:10], "big"),
-        "soc": payload[19] if len(payload) > 19 else None,
-        "temperature": parse_temperature(payload),
-    }
 
 
 def parse_temperature(payload):
@@ -314,6 +335,18 @@ def parse_temperature(payload):
         return None
 
     return round(sum(temperatures) / len(temperatures), 2)
+
+
+def parse_basic(payload):
+    return {
+        "voltage": int.from_bytes(payload[0:2], "big") / 100,
+        "current": int.from_bytes(payload[2:4], "big", signed=True) / 100,
+        "cap_rem": int.from_bytes(payload[4:6], "big") / 100,
+        "cap_nom": int.from_bytes(payload[6:8], "big") / 100,
+        "cycles": int.from_bytes(payload[8:10], "big"),
+        "soc": payload[19] if len(payload) > 19 else None,
+        "temperature": parse_temperature(payload),
+    }
 
 
 def parse_cells(payload):
@@ -395,6 +428,7 @@ async def get_sample(client):
 
 
 # ================= MAIN =================
+
 
 async def main_loop():
     while True:
