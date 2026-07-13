@@ -9,7 +9,7 @@ from bleak import BleakClient
 
 # ================= CONFIG =================
 
-ADDRESS = "A5:C2:37:58:BF:EA"  # Cambiar segun bateria
+ADDRESS = "A5:C2:37:58:BF:C4"  # Cambiar segun bateria
 
 NOTIFY_CHAR = "0000ff01-0000-1000-8000-00805f9b34fb"
 WRITE_CHAR = "0000ff02-0000-1000-8000-00805f9b34fb"
@@ -19,7 +19,7 @@ REQUEST_TIMEOUT = 8
 PENDING_BATCH_SIZE = 50
 
 API_URL = "http://api.oceandev.cl/api/data"
-TOKEN = "bms-rulltnrmv3uinuzkwmrnjnhk"  # Cambiar por el token entregado por la plataforma
+TOKEN = "bms-nykm09shedunhzw3yiywbrjw"  # Cambiar por el token entregado por la plataforma
 
 DB_PATH = "bms.db"
 
@@ -58,6 +58,7 @@ def ensure_schema():
             cap_nom REAL,
             cycles INTEGER,
             delta_v REAL,
+            temperature REAL,
             status TEXT,
             uploaded INTEGER DEFAULT 0,
             uploaded_at INTEGER DEFAULT NULL
@@ -78,6 +79,15 @@ def ensure_schema():
             """
         )
         print("[DB] Added missing column: uploaded_at")
+
+    if "temperature" not in existing_columns:
+        cursor.execute(
+            """
+            ALTER TABLE bms_data
+            ADD COLUMN temperature REAL DEFAULT NULL
+            """
+        )
+        print("[DB] Added missing column: temperature")
 
     cursor.execute(
         """
@@ -144,6 +154,7 @@ def upload_to_server(data):
             "cn": data["capacity_nom_ah"],
             "cy": data["cycles"],
             "dv": data["delta_v"],
+            "t": data.get("temperature"),
             "st": data["status"],
         },
     }
@@ -163,8 +174,8 @@ def save_local(data):
     cursor.execute(
         """
         INSERT INTO bms_data
-        (ts, voltage, current, power, soc, cap_rem, cap_nom, cycles, delta_v, status, uploaded)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0)
+        (ts, voltage, current, power, soc, cap_rem, cap_nom, cycles, delta_v, temperature, status, uploaded)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0)
         """,
         (
             data["ts"],
@@ -176,6 +187,7 @@ def save_local(data):
             data["capacity_nom_ah"],
             data["cycles"],
             data["delta_v"],
+            data.get("temperature"),
             data["status"],
         ),
     )
@@ -223,6 +235,7 @@ def upload_pending():
                 "capacity_nom_ah": row["cap_nom"],
                 "cycles": row["cycles"],
                 "delta_v": row["delta_v"],
+                "temperature": row["temperature"],
                 "status": row["status"],
             }
 
@@ -268,7 +281,39 @@ def parse_basic(payload):
         "cap_nom": int.from_bytes(payload[6:8], "big") / 100,
         "cycles": int.from_bytes(payload[8:10], "big"),
         "soc": payload[19] if len(payload) > 19 else None,
+        "temperature": parse_temperature(payload),
     }
+
+
+def parse_temperature(payload):
+    if len(payload) <= 22:
+        return None
+
+    sensor_count = payload[22]
+    if sensor_count <= 0:
+        return None
+
+    temperatures = []
+    base_offset = 23
+
+    for index in range(sensor_count):
+        start = base_offset + (index * 2)
+        end = start + 2
+
+        if end > len(payload):
+            break
+
+        raw_value = int.from_bytes(payload[start:end], "big")
+        if raw_value <= 0:
+            continue
+
+        celsius = (raw_value - 2731) / 10
+        temperatures.append(celsius)
+
+    if not temperatures:
+        return None
+
+    return round(sum(temperatures) / len(temperatures), 2)
 
 
 def parse_cells(payload):
@@ -342,6 +387,7 @@ async def get_sample(client):
         "capacity_nom_ah": info["cap_nom"],
         "cycles": info["cycles"],
         "delta_v": round(vmax - vmin, 4),
+        "temperature": info["temperature"],
     }
 
     data["status"] = get_status(data)
