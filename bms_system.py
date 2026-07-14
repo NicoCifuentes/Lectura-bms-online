@@ -10,7 +10,7 @@ from bleak import BleakClient
 
 # ================= CONFIG =================
 
-ADDRESS = "A5:C2:37:58:BF:0B"
+ADDRESS = "A5:C2:37:58:BF:98"
 
 NOTIFY_CHAR = "0000ff01-0000-1000-8000-00805f9b34fb"
 WRITE_CHAR = "0000ff02-0000-1000-8000-00805f9b34fb"
@@ -20,7 +20,7 @@ REQUEST_TIMEOUT = 8
 PENDING_BATCH_SIZE = 50
 
 API_URL = "http://api.oceandev.cl/api/data"
-TOKEN = "bms-esctzy69wefcb2aequhbdoug"
+TOKEN = "bms-ukzcngoohmeupriqsq0patid"
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 DB_PATH = os.path.join(BASE_DIR, "bms.db")
